@@ -4,8 +4,38 @@
  *
  * Node 22, standard library only, no network, deterministic.
  *
- * Model v2 (written from scratch for this bounty; replaces the v1
- * hierarchical log-time logit model):
+ * Model v3 (rank defense: v2 ranked 858/4536, only 142 inside the
+ * top 1,000; v3 beats v2 on a cohort-simulator backtest, 6 tuned + 3
+ * held-out scenarios, on the final-shaped case and on the mean):
+ *
+ * What v3 changed vs v2, and why (cohort-simulator backtest, 6 tuned
+ * scenarios x 4 cases + 3 held-out scenarios; mean pinball loss):
+ *   - recent-slope tangent (was the quadratic's slope-now): the
+ *     backtest's median logit error fell by roughly half at every
+ *     checkpoint, because the quadratic averages the stale
+ *     launch-night stretch and the dilution dip into today's slope.
+ *   - tangent weight 0.9 (was 0.5): the tangent is the better
+ *     estimator at both ends of the history; the global line is
+ *     only a 10% anchor against a noisy recent window.
+ *   - pre-refresh reads at 25% weight (was full weight): the stale
+ *     launch-night page bends every fitted slope while the history
+ *     is short, and the effect washes out only once many refreshes
+ *     have landed.
+ *   - spread horizon term 0.05*sqrt(days) (was 0.15): the optimal
+ *     spread grows far slower than a random walk once the history
+ *     holds several refreshes; the 0.2 floor and the residual /
+ *     disagreement / slope terms carry the real uncertainty.
+ * Backtest (v2 -> v3 mean pinball; lower is better):
+ *   scenario   f00 (final-shaped)   mean (4 cases)
+ *   central    0.122 -> 0.065        0.158 -> 0.117
+ *   bigN       0.107 -> 0.059        0.179 -> 0.132
+ *   smallN     0.121 -> 0.077        0.155 -> 0.120
+ *   fast       0.142 -> 0.065        0.144 -> 0.090
+ *   slow       0.095 -> 0.062        0.319 -> 0.246
+ *   lagworld   0.163 -> 0.087        0.198 -> 0.119
+ *   held-out A/B/C f00: 0.120/0.201/0.110 -> 0.069/0.075/0.066.
+ * v3 wins the final-shaped case and the mean in all 9 scenarios.
+ *
  *
  * A trophy's earn rate is a ratio, rate = earned / players_tracked,
  * and the two sides move in opposite directions: new players joining
@@ -23,21 +53,27 @@
  *    where the rate line bends. Slopes are shrunk toward the tier
  *    median; noisy small-count reads are down-weighted.
  *  - the rate forecast is E_i(target) / N(target), ensembled in logit
- *    space with v1's rate-line forecast. Each member is the average of
- *    its global log-time line and a tangent forecast: the curve bends
- *    (it steepens while new cohorts pile in, then flattens as earned
- *    counts saturate), so a shrunk quadratic estimates the slope
- *    *now*, at the last read, and the tangent extends that slope
- *    linearly from the last rate — the bend sets today's slope, never
- *    the shape of a 4-day extrapolation, which a raw quadratic would
- *    blow up. The two members disagree exactly when the extrapolation
- *    is fragile, so their disagreement also sets the spread.
+ *    space with v1's rate-line forecast. Each member is mostly a
+ *    tangent forecast: the curve bends (it steepens while new cohorts
+ *    pile in, then flattens as earned counts saturate), so the slope
+ *    *now* is read off a short linear fit on the last few post-refresh
+ *    reads — the recent slope, not the quadratic's slope-now, which
+ *    the flat launch-night segment bends the wrong way — and the
+ *    tangent extends that slope from the last rate, damped as the
+ *    growth saturates. The global log-time line is only a 10% anchor:
+ *    on the backtest the tangent's median error is roughly half the
+ *    line's at every checkpoint. The two members disagree exactly when
+ *    the extrapolation is fragile, so their disagreement also sets
+ *    the spread.
  *  - spread: the honest uncertainty is far smaller than v1's
  *    0.45*sqrt(days) random walk once the history holds several
  *    refreshes (v1's f00 spread ~1.0 logit vs a measured median error
  *    of ~0.16 across backtest worlds, most of its pinball loss was
- *    width, not bias). v2's spread combines a small base term, a
- *    horizon term, the fits' residuals, the ensemble disagreement, a
+ *    width, not bias). v3's spread combines a small base term, a
+ *    horizon term (0.05*sqrt(days): the backtest's optimal horizon
+ *    growth is far below the random walk's, and the 0.2 floor plus
+ *    the residual/disagreement/slope terms carry the real
+ *    uncertainty), the fits' residuals, the ensemble disagreement, a
  *    staleness term and a thin-data term.
  *  - the flat-history refresh prior from v1 is kept unchanged: when
  *    the page has never refreshed, a flat forecast would trust rates
@@ -46,6 +82,13 @@
  *    (638 -> 3868 on the first refresh), then rates resume their
  *    log-time climb.
  *  - a trophy at 100% in the last read stays 100%.
+ *
+ *  - the reads before Exophase's first refresh show a stale page
+ *    (launch-night rates on 638 players, before the tracked count
+ *    jumped to 3,868): they still anchor the level, but they bend
+ *    every slope the wrong way while the history is short, so the
+ *    line and count fits down-weight them to 25%, and the recent
+ *    slope reads only post-refresh reads.
  *
  * Usage: MAKEFUN_INPUT_DIR=<dir> MAKEFUN_OUTPUT_DIR=<dir> node main.ts
  * Reads every *.in in the input dir, writes <id>.out per case.
@@ -62,6 +105,11 @@ const RELEASE_MS = Date.parse("2026-11-19T00:00:00Z");
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
 const HALF_LIFE_HOURS = 18;
+// v3: the tangent carries the forecast (see header).
+const TANGENT_W = 0.9;
+const RECENT_N = 6;
+const PRE_REFRESH_W = 0.25;
+const SPREAD_HORIZ_COEF = 0.05;
 
 // First-refresh dilution: on the first refresh Exophase's tracked
 // players jumped 638 -> 3868 while total trophies earned went 943 ->
@@ -132,6 +180,7 @@ interface Obs {
   y: number;
   w: number;
   t: number; // ms since release, for recency weighting
+  dj?: number; // index in `distinct`
 }
 
 interface LineFit {
@@ -144,6 +193,7 @@ interface LineFit {
   lastRate: number;
   quad: { a: number; b: number; c: number; rms: number; u0: number } | null;
   u0: number;
+  recentSlope: number | null;
 }
 
 /** Weighted least squares of y on x; returns slope, intercept, rms. */
@@ -185,6 +235,13 @@ function wls(obs: Obs[]): { slope: number; intercept: number; rms: number; seSlo
  * is shrunk toward 0 (a straight line) and clamped, and is only used
  * with enough points and x-spread; with too little data it falls back
  * to the linear fit. Solves the 3x3 normal equations by Cramer.
+ *
+ * v3: the quadratic is now only the fallback for the tangent slope
+ * (used when the recent slope is null, i.e. fewer than 3 post-refresh
+ * reads or too little x-spread). Its slope-now was v2's tangent
+ * slope; the backtest showed the recent slope reads the phase better,
+ * because the quadratic averages the stale launch-night stretch and
+ * the dilution dip into today's slope.
  */
 function wlsQuad(obs: Obs[]): { a: number; b: number; c: number; rms: number; u0: number } | null {
   const n = obs.length;
@@ -252,6 +309,89 @@ function wlsQuad(obs: Obs[]): { a: number; b: number; c: number; rms: number; u0
   return { a, b, c, rms: Math.sqrt(se / sw), u0 };
 }
 
+/**
+ * The slope *now*: a straight line through the last RECENT_N
+ * post-first-refresh observations. The global line and the quadratic
+ * both average the whole history, whose early stretch is the stale
+ * launch-night page and the dilution dip; the recent slope reads the
+ * phase the curve is in today — steepening while new cohorts pile in,
+ * flattening as earned counts saturate — which is what a 4-day
+ * extrapolation has to get right. Null with too few post-refresh
+ * points or too little x-spread (the caller falls back to the
+ * quadratic's slope-now, then the global slope).
+ */
+function recentSlopeOf(obs: Obs[], fromIdx: number): number | null {
+  const pool = obs.filter((o) => (o.dj ?? 0) >= fromIdx);
+  const recent = pool.slice(-RECENT_N);
+  if (recent.length < 3) return null;
+  const xs = recent.map((o) => o.x);
+  if (Math.max(...xs) - Math.min(...xs) < 0.05) return null;
+  return wls(recent).slope;
+}
+
+/** Root-sum-of-squares of spread terms (each already in logit units). */
+function quadSpread(terms: number[]): number {
+  let s = 0;
+  for (const t of terms) s += t * t;
+  return Math.sqrt(s);
+}
+
+/**
+ * Combine the two members in logit space. The counts member compounds
+ * two forecasts (earned and tracked), so its edge fades as the horizon
+ * lengthens; the rate line is the steadier long-horizon member, so the
+ * counts weight falls from 0.7 at a 0-day horizon to 0.3 at 5 days.
+ * The members' disagreement is returned too: it feeds the spread,
+ * because the members disagree exactly when the extrapolation is
+ * fragile. With only one member, the other contributes nothing and
+ * there is nothing to disagree about.
+ */
+function ensemblePred(
+  linePred: number | null,
+  countPred: number | null,
+  lineConf: number,
+  countConf: number,
+  horizonDays: number,
+): { pred: number; disagree: number } {
+  if (linePred !== null && countPred !== null) {
+    const wCounts = clamp(0.7 - 0.08 * horizonDays, 0.3, 0.7);
+    const lw = lineConf * (1 - wCounts);
+    const cw = countConf * wCounts;
+    return {
+      pred: (lw * linePred + cw * countPred) / (lw + cw),
+      disagree: Math.abs(linePred - countPred),
+    };
+  }
+  if (linePred !== null) return { pred: linePred, disagree: 0 };
+  return { pred: countPred as number, disagree: 0 };
+}
+
+/**
+ * Flat history: the page has never refreshed, so the last rates are
+ * the stale launch-night page. The refresh prior (from v1) dilutes
+ * every rate to ~0.22x with an easiness tilt (easy trophies keep more
+ * of their rate), then the tier's log-time climb resumes from there.
+ * Returns the median logit and the spread.
+ */
+function flatHistoryForecast(
+  lastRate: number,
+  lastLogit: number,
+  capMove: number,
+  flatNorm: number,
+  tier: string,
+  targetX: number,
+  xLast: number,
+  horizonDays: number,
+): { medLogit: number; spread: number } {
+  const g = TIER_PRIOR_SLOPE[tier] ?? 0.15;
+  const climb = g * Math.max(0, targetX - xLast);
+  const powered = Math.pow(lastRate, REFRESH_POWER);
+  let medLogit = logit(flatNorm * powered) + climb;
+  medLogit = clamp(medLogit, lastLogit - capMove, lastLogit + capMove);
+  const horizonTerm = 0.45 * Math.sqrt(horizonDays);
+  return { medLogit, spread: quadSpread([0.3, horizonTerm, 0.6]) };
+}
+
 interface CaseTrophy {
   id: number;
   tier: string;
@@ -266,9 +406,13 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
 
   // Collapse to distinct reads: a read counts as new only when some
   // trophy's rate or the tracked-player count differs from the
-  // previous distinct read. Keep the first occurrence time of each.
-  // A null rate means "this read lacked the trophy", not "the rate
-  // changed", so nulls are forward-filled for the comparison only.
+  // previous distinct read. Exophase refreshes every few hours while
+  // the recorder reads every 10-30 minutes, so most reads repeat the
+  // last refreshed page and would otherwise swamp the fits with
+  // dozens of copies of one point. Keep the first occurrence time
+  // of each distinct read. A null rate means "this read lacked the
+  // trophy", not "the rate changed", so nulls are forward-filled for
+  // the comparison only.
   const distinct: any[] = [];
   let prevKey = "";
   let prevRates: (number | null)[] = [];
@@ -314,6 +458,17 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
   }
   const lastN = nSeries.length ? nSeries[nSeries.length - 1] : 0;
 
+  // First-refresh index: the first distinct read whose tracked-player
+  // count jumps >1.5x the first read's (Exophase's first refresh, 638
+  // -> 3,868). Reads before it show the stale launch-night page.
+  let fitStartIdx = 0;
+  {
+    const n0 = nSeries[0] || 0;
+    for (let j = 1; j < nSeries.length; j++) {
+      if (n0 > 0 && nSeries[j] > 1.5 * n0) { fitStartIdx = j; break; }
+    }
+  }
+
   // Forecast players tracked at the target: ln N on log-hours.
   // Join growth is sublinear, so the slope is clamped to [0, 1.5];
   // the count only grows, so the forecast never falls below the last.
@@ -339,17 +494,23 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
     }
   }
 
-  // Per-trophy rate-line fits (v1's member) on the whole history: the
-  // recent-window variant over-extrapolated the steep recovery
-  // segment on the final's long horizon (backtest f00 bias -0.46).
+  // Per-trophy rate-line fits (v1's member) on the whole history.
+  // The fits keep every distinct read: the launch-night reads still
+  // anchor the level, but the pre-first-refresh ones are down-weighted
+  // (PRE_REFRESH_W) because their stale rates bend the slope, and the
+  // tangent slope is read off the recent post-refresh window instead
+  // (see recentSlopeOf). An earlier variant that fit only post-refresh
+  // reads fixed short histories but over-shot the final's long
+  // horizon, so the full history stays, weighted.
   const lineFits: (LineFit | null)[] = trophies.map((t, i) => {
     const obs: Obs[] = [];
-    for (const read of distinct) {
+    for (let dj = 0; dj < distinct.length; dj++) {
+      const read = distinct[dj];
       const r = read.rates[i];
       if (r === null || r === undefined) continue;
       const ageH = Math.max(0, (checkpointMs - Date.parse(read.at)) / 3600000);
       const w = Math.pow(0.5, ageH / HALF_LIFE_HOURS);
-      obs.push({ x: logHours(read.at), y: logit(r), w, t: Date.parse(read.at) - RELEASE_MS });
+      obs.push({ x: logHours(read.at), y: logit(r), w: dj < fitStartIdx ? w * PRE_REFRESH_W : w, t: Date.parse(read.at) - RELEASE_MS, dj });
     }
     if (obs.length < 2) return null;
     const xs = obs.map((o) => o.x);
@@ -366,6 +527,7 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
       lastRate,
       quad: wlsQuad(obs),
       u0: obs.reduce((s, o) => s + o.w * o.x, 0) / obs.reduce((s, o) => s + o.w, 0),
+      recentSlope: recentSlopeOf(obs, fitStartIdx),
     };
   });
 
@@ -381,6 +543,7 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
     eLast: number;
     xLast: number;
     quad: { a: number; b: number; c: number; rms: number; u0: number } | null;
+    recentSlope: number | null;
   }
   const countFits: (CountFit | null)[] = trophies.map((t, i) => {
     const obs: Obs[] = [];
@@ -399,8 +562,9 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
       obs.push({
         x: logHours(read.at),
         y: Math.log(Math.max(runMax, 0.5)),
-        w,
+        w: j < fitStartIdx ? w * PRE_REFRESH_W : w,
         t: Date.parse(read.at) - RELEASE_MS,
+        dj: j,
       });
     }
     if (obs.length < 2) return null;
@@ -416,6 +580,7 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
       eLast: runMax,
       xLast: lastRead ? logHours(lastRead.at) : 0,
       quad: wlsQuad(obs),
+      recentSlope: recentSlopeOf(obs, fitStartIdx),
     };
   });
 
@@ -488,15 +653,18 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
         const k = 3; // pseudo-count of group observations
         const slope = (fit.n * fit.slope + k * g) / (fit.n + k);
         let pred = fit.intercept + slope * targetX;
-        // Tangent prediction: the bend (quadratic) estimates the
-        // slope *now*, at the last read, and the forecast extends
-        // that slope linearly from the last rate. The global line
-        // averages the whole history, so it over-shoots once the
+        // Tangent prediction: the recent slope (see recentSlopeOf)
+        // is the slope *now*, at the last read, and the forecast
+        // extends that slope linearly from the last rate. The global
+        // line averages the whole history, so it over-shoots once the
         // curve flattens and under-shoots while it steepens; the
-        // tangent corrects both, and the 50/50 blend hedges the two.
+        // tangent corrects both, and the 10% line weight hedges a
+        // noisy recent window.
         const xLast = fit.xLast;
         let slopeNow = fit.slope;
-        if (fit.quad) {
+        if (fit.recentSlope !== null) {
+          slopeNow = fit.recentSlope;
+        } else if (fit.quad) {
           slopeNow = fit.quad.b + 2 * fit.quad.c * (xLast - fit.quad.u0);
         }
         slopeNow = (fit.n * clamp(slopeNow, -0.3, 1.2) + k * g) / (fit.n + k);
@@ -506,7 +674,7 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
         const dx = Math.max(0, targetX - xLast);
         const damp = dx > 0 ? Math.log1p(0.6 * dx) / (0.6 * dx) : 1;
         const tangentPred = lastLogit + slopeNow * dx * damp;
-        pred = 0.5 * pred + 0.5 * tangentPred;
+        pred = (1 - TANGENT_W) * pred + TANGENT_W * tangentPred;
         const wFit =
           Math.max(0.35, 1 - fit.rms / 2) * (0.6 + 0.1 * Math.min(fit.n, 4));
         pred = wFit * pred + (1 - wFit) * lastLogit;
@@ -522,11 +690,13 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
         const slope = (cfit.n * cfit.slope + k * g) / (cfit.n + k);
         let ePred = Math.exp(cfit.intercept + slope * targetX);
         // Tangent counts: extend the *current* earned-count growth
-        // rate linearly in log-time from the last count. Same idea
-        // as the rate line's tangent: the bend sets today's slope,
-        // not the shape of the whole extrapolation.
+        // rate (the recent slope) linearly in log-time from the last
+        // count. Same idea as the rate line's tangent: today's slope
+        // sets the move, not the shape of the whole extrapolation.
         let slopeNow = cfit.slope;
-        if (cfit.quad) {
+        if (cfit.recentSlope !== null) {
+          slopeNow = cfit.recentSlope;
+        } else if (cfit.quad) {
           slopeNow = cfit.quad.b + 2 * cfit.quad.c * (cfit.xLast - cfit.quad.u0);
         }
         slopeNow = (cfit.n * clamp(slopeNow, 0, 2.0) + k * g) / (cfit.n + k);
@@ -534,7 +704,7 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
         const damp = dx > 0 ? Math.log1p(0.6 * dx) / (0.6 * dx) : 1;
         const tangentE =
           cfit.eLast * Math.exp(slopeNow * dx * damp);
-        ePred = Math.sqrt(Math.max(ePred, 0.5) * Math.max(tangentE, 0.5));
+        ePred = Math.exp((1 - TANGENT_W) * Math.log(Math.max(ePred, 0.5)) + TANGENT_W * Math.log(Math.max(tangentE, 0.5)));
         // Counts only grow; never predict fewer earned than today.
         ePred = Math.max(ePred, cfit.eLast);
         const ratePred = (ePred / nPred) * 100;
@@ -542,27 +712,12 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
         countConf = clamp(0.3 + 0.1 * Math.min(cfit.n, 5) - cfit.rms, 0.2, 1);
       }
       // --- ensemble in logit space ---
-      // The counts member compounds two forecasts (earned and
-      // tracked), so its edge fades as the horizon lengthens; the
-      // rate line is the steadier long-horizon member. The counts
-      // weight therefore falls with the horizon, from 0.7 at a
-      // 0-day horizon to 0.3 at 5 days.
-      let pred: number;
-      let disagree = 0;
-      if (linePred !== null && countPred !== null) {
-        disagree = Math.abs(linePred - countPred);
-        const wCounts = clamp(0.7 - 0.08 * horizonDays, 0.3, 0.7);
-        const lw = lineConf * (1 - wCounts);
-        const cw = countConf * wCounts;
-        pred = (lw * linePred + cw * countPred) / (lw + cw);
-      } else if (linePred !== null) {
-        pred = linePred;
-      } else {
-        pred = countPred as number;
-      }
+      const ens = ensemblePred(linePred, countPred, lineConf, countConf, horizonDays);
+      let pred = ens.pred;
+      const disagree = ens.disagree;
       pred = clamp(pred, lastLogit - capMove, lastLogit + capMove);
       medLogit = pred;
-      const horizonTerm = 0.15 * Math.sqrt(horizonDays);
+      const horizonTerm = SPREAD_HORIZ_COEF * Math.sqrt(horizonDays);
       const rmsTerm = fit ? 0.6 * fit.rms : 0;
       const disagreeTerm = 0.5 * disagree;
       // Slope uncertainty over the extrapolation distance: the
@@ -580,27 +735,29 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
       );
       const staleTerm = staleHours >= 6 ? 0.15 : 0;
       const thinTerm = fit && fit.n === 2 ? 0.25 : 0;
-      spread = Math.sqrt(
-        0.15 * 0.15 +
-          horizonTerm * horizonTerm +
-          rmsTerm * rmsTerm +
-          disagreeTerm * disagreeTerm +
-          slopeUnc * slopeUnc +
-          staleTerm * staleTerm +
-          thinTerm * thinTerm,
-      );
+      spread = quadSpread([
+        0.15,
+        horizonTerm,
+        rmsTerm,
+        disagreeTerm,
+        slopeUnc,
+        staleTerm,
+        thinTerm,
+      ]);
     } else if (distinct.length <= 1) {
       // Flat history: refresh prior, then the tier's log-time climb.
-      // Power-law medians: easy trophies keep more of their rate.
-      const g = TIER_PRIOR_SLOPE[t.tier] ?? 0.15;
-      const xLast = lastRead ? logHours(lastRead.at) : 0;
-      const climb = g * Math.max(0, targetX - xLast);
-      const norm = flatNorm;
-      const powered = Math.pow(lastRate, REFRESH_POWER);
-      medLogit = logit(norm * powered) + climb;
-      medLogit = clamp(medLogit, lastLogit - capMove, lastLogit + capMove);
-      const horizonTerm = 0.45 * Math.sqrt(horizonDays);
-      spread = Math.sqrt(0.3 * 0.3 + horizonTerm * horizonTerm + 0.6 * 0.6);
+      const f = flatHistoryForecast(
+        lastRate,
+        lastLogit,
+        capMove,
+        flatNorm,
+        t.tier,
+        targetX,
+        lastRead ? logHours(lastRead.at) : 0,
+        horizonDays,
+      );
+      medLogit = f.medLogit;
+      spread = f.spread;
     } else {
       // The page has refreshed at least once but this trophy has no
       // usable line (too few points, or no x-spread): persist the last
@@ -608,7 +765,7 @@ function forecastCase(kase: any): { trophies: { id: number; q: number[] }[] } {
       // here — the dilution it prices has already happened.
       medLogit = lastLogit;
       const horizonTerm = 0.15 * Math.sqrt(horizonDays);
-      spread = Math.sqrt(0.15 * 0.15 + horizonTerm * horizonTerm + 0.6 * 0.6);
+      spread = quadSpread([0.15, horizonTerm, 0.6]);
     }
     spread = clamp(spread, 0.2, 1.3);
     let prev = 0;
